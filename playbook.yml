@@ -1,0 +1,85 @@
+---
+- name: Deploy Nagios plugins and NRPE on all servers
+  hosts: all
+  become: true
+  vars:
+    nagios_server_ip: 10.13.1.85
+    plugins_dir: /usr/lib/nagios/plugins
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # Use the basic package only; nagios-plugins-contrib pulls in
+    # nscp/libboost and fails on unmet dependencies
+    - name: Install Nagios plugins and NRPE
+      ansible.builtin.apt:
+        name:
+          - monitoring-plugins-basic
+          - monitoring-plugins-standard
+          - nagios-nrpe-server
+        state: present
+
+    - name: Allow the Nagios server in nrpe.cfg
+      ansible.builtin.lineinfile:
+        path: /etc/nagios/nrpe.cfg
+        regexp: '^allowed_hosts='
+        line: "allowed_hosts=127.0.0.1,::1,{{ nagios_server_ip }}"
+      notify: Restart NRPE
+
+    - name: Define basic NRPE checks
+      ansible.builtin.copy:
+        dest: /etc/nagios/nrpe_local.cfg
+        mode: '0644'
+        content: |
+          command[check_users]={{ plugins_dir }}/check_users -w 5 -c 10
+          command[check_load]={{ plugins_dir }}/check_load -r -w .15,.10,.05 -c .30,.25,.20
+          command[check_disk]={{ plugins_dir }}/check_disk -w 20% -c 10% -p /
+          command[check_procs]={{ plugins_dir }}/check_procs -w 250 -c 400
+      notify: Restart NRPE
+
+    - name: Enable and start NRPE
+      ansible.builtin.service:
+        name: nagios-nrpe-server
+        state: started
+        enabled: true
+
+    - name: Open NRPE port 5666 to the Nagios server (if ufw is active)
+      community.general.ufw:
+        rule: allow
+        port: '5666'
+        proto: tcp
+        src: "{{ nagios_server_ip }}"
+      ignore_errors: true
+
+  handlers:
+    - name: Restart NRPE
+      ansible.builtin.service:
+        name: nagios-nrpe-server
+        state: restarted
+
+- name: Fix empty libexec on the Nagios server itself
+  hosts: nagios
+  become: true
+  tasks:
+    - name: Install plugins on the Nagios server
+      ansible.builtin.apt:
+        name:
+          - monitoring-plugins-basic
+          - monitoring-plugins-standard
+          - nagios-nrpe-plugin
+        state: present
+
+    - name: Link plugins into /usr/local/nagios/libexec
+      ansible.builtin.shell: |
+        for f in /usr/lib/nagios/plugins/*; do
+          ln -sf "$f" /usr/local/nagios/libexec/$(basename "$f")
+        done
+      changed_when: false
+
+    - name: Restart Nagios
+      ansible.builtin.service:
+        name: nagios
+        state: restarted
